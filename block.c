@@ -17,6 +17,7 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -362,6 +363,15 @@ static int block_child_stdout(struct block *block)
 
 static int block_child_exec(struct block *block)
 {
+	int err;
+
+	/* Run the command where it was configured */
+	if (block->dir && *block->dir) {
+		err = sys_chdir(block->dir);
+		if (err)
+			return err;
+	}
+
 	return sys_execsh(block->command);
 }
 
@@ -526,6 +536,33 @@ void block_close(struct block *block)
 	block->overflow = false;
 }
 
+/* Terminate the running command, if any, before the block goes away */
+void block_stop(struct block *block)
+{
+	int err;
+
+	if (!block_is_spawned(block))
+		return;
+
+	/* Disable event I/O for the command's output */
+	err = sys_async(block->out[0], 0);
+	if (err)
+		error("[%s] failed to disable event I/O", block->name);
+
+	err = sys_kill(block->pid, SIGTERM);
+	if (err)
+		error("[%s] failed to terminate process %d", block->name, block->pid);
+
+	err = sys_waitpid(block->pid, NULL);
+	if (err)
+		error("[%s] failed to wait for process %d", block->name, block->pid);
+
+	block_debug(block, "process %d stopped", block->pid);
+
+	block->pid = 0;
+	block_close(block);
+}
+
 int block_reap(struct block *block)
 {
 	int err;
@@ -622,10 +659,11 @@ void block_destroy(struct block *block)
 	map_destroy(block->config);
 	map_destroy(block->env);
 	free(block->name);
+	free(block->dir);
 	free(block);
 }
 
-struct block *block_create(struct bar *bar, const struct map *config)
+struct block *block_create(struct bar *bar, const struct map *config, const char *dir)
 {
 	struct block *block;
 	int err;
@@ -635,6 +673,14 @@ struct block *block_create(struct bar *bar, const struct map *config)
 		return NULL;
 
 	block->bar = bar;
+
+	if (dir) {
+		block->dir = strdup(dir);
+		if (!block->dir) {
+			free(block);
+			return NULL;
+		}
+	}
 
 	block->config = map_create();
 	if (!block->config) {

@@ -32,6 +32,11 @@ struct bar {
 
 	/* Click events read from i3bar */
 	struct line clicks;
+
+	/* Configuration sources, read again on SIGHUP */
+	const char *path;
+	const char *conf_dir;
+	const char *user_conf_dir;
 };
 
 #define bar_printf(bar, lvl, fmt, ...) \
