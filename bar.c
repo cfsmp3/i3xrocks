@@ -190,31 +190,12 @@ static int gcd(int a, int b)
 	return a;
 }
 
-static int bar_setup(struct bar *bar)
+/* Block the signals waited for, before the bar announces itself */
+static int bar_sigsetup(struct bar *bar)
 {
-	struct block *block = bar->blocks;
 	sigset_t *set = &bar->sigset;
-	unsigned long sleeptime = 0;
 	int sig;
 	int err;
-
-	while (block) {
-		err = block_setup(block);
-		if (err)
-			return err;
-
-		/* The maximum sleep time is actually the GCD
-		 * between all positive block intervals.
-		 */
-		if (block->interval > 0) {
-			if (sleeptime > 0)
-				sleeptime = gcd(sleeptime, block->interval);
-			else
-				sleeptime = block->interval;
-		}
-
-		block = block->next;
-	}
 
 	err = sys_sigemptyset(set);
 	if (err)
@@ -269,6 +250,33 @@ static int bar_setup(struct bar *bar)
 	err = sys_sigsetmask(set);
 	if (err)
 		return err;
+
+	return 0;
+}
+
+static int bar_setup(struct bar *bar)
+{
+	struct block *block = bar->blocks;
+	unsigned long sleeptime = 0;
+	int err;
+
+	while (block) {
+		err = block_setup(block);
+		if (err)
+			return err;
+
+		/* The maximum sleep time is actually the GCD
+		 * between all positive block intervals.
+		 */
+		if (block->interval > 0) {
+			if (sleeptime > 0)
+				sleeptime = gcd(sleeptime, block->interval);
+			else
+				sleeptime = block->interval;
+		}
+
+		block = block->next;
+	}
 
 	if (sleeptime) {
 		err = sys_setitimer(sleeptime);
@@ -425,6 +433,12 @@ static struct bar *bar_create(bool term)
 	}
 
 	bar->term = term;
+
+	err = bar_sigsetup(bar);
+	if (err) {
+		bar_destroy(bar);
+		return NULL;
+	}
 
 	err = bar_start(bar);
 	if (err) {
