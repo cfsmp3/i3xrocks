@@ -299,6 +299,29 @@ int sys_read(int fd, void *buf, size_t size, size_t *count)
 	return 0;
 }
 
+/* Write the whole buffer */
+int sys_write(int fd, const void *buf, size_t size)
+{
+	ssize_t rc;
+
+	while (size) {
+		rc = write(fd, buf, size);
+		if (rc == -1) {
+			if (errno == EINTR)
+				continue;
+
+			sys_errno("write(%d, %zu)", fd, size);
+			rc = -errno;
+			return rc;
+		}
+
+		buf = (const char *) buf + rc;
+		size -= rc;
+	}
+
+	return 0;
+}
+
 int sys_dup(int fd1, int fd2)
 {
 	int rc;

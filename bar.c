@@ -150,6 +150,7 @@ static void bar_poll_exited(struct bar *bar)
 			block_reap(block);
 			if (block->interval == INTERVAL_PERSIST) {
 				block_debug(block, "unexpected exit?");
+				block_read(block);
 			} else {
 				block_update(block);
 			}
@@ -172,14 +173,32 @@ static void bar_poll_readable(struct bar *bar, const int fd)
 	struct block *block = bar->blocks;
 
 	while (block) {
-		if (block->out[0] == fd) {
+		if (block->pid > 0 && block->out[0] == fd) {
 			block_debug(block, "readable");
-			block_update(block);
+			if (block_read(block) != -EAGAIN)
+				bar_print(bar);
 			break;
 		}
 
 		block = block->next;
 	}
+}
+
+/* The kernel falls back to SIGIO when real-time signals cannot be queued */
+static void bar_poll_outputs(struct bar *bar)
+{
+	struct block *block = bar->blocks;
+	bool updated = false;
+
+	while (block) {
+		if (block->pid > 0 && block_read(block) != -EAGAIN)
+			updated = true;
+
+		block = block->next;
+	}
+
+	if (updated)
+		bar_print(bar);
 }
 
 static int gcd(int a, int b)
@@ -234,7 +253,7 @@ static int bar_sigsetup(struct bar *bar)
 	if (err)
 		return err;
 
-	/* I/O Possible signal for persistent blocks */
+	/* I/O Possible signal for block outputs */
 	err = sys_sigaddset(set, SIGRTMIN);
 	if (err)
 		return err;
@@ -303,9 +322,9 @@ static void bar_teardown(struct bar *bar)
 	struct block *block = bar->blocks;
 	int err;
 
-	/* Disable event I/O for blocks (persistent) */
+	/* Disable event I/O for blocks (running commands) */
 	while (block) {
-		if (block->interval == INTERVAL_PERSIST) {
+		if (block->pid > 0) {
 			err = sys_async(block->out[0], 0);
 			if (err)
 				block_error(block, "failed to disable event I/O");
@@ -374,12 +393,12 @@ static int bar_poll(struct bar *bar)
 
 		if (sig == SIGIO) {
 			bar_read(bar);
+			bar_poll_outputs(bar);
 			continue;
 		}
 
 		if (sig == SIGRTMIN) {
 			bar_poll_readable(bar, fd);
-			bar_print(bar);
 			continue;
 		}
 
@@ -414,6 +433,7 @@ static void bar_destroy(struct bar *bar)
 		block = next;
 	}
 
+	line_clear(&bar->clicks);
 	free(bar);
 }
 

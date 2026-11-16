@@ -22,6 +22,7 @@
 #include <sys/types.h>
 
 #include "bar.h"
+#include "line.h"
 #include "log.h"
 #include "map.h"
 
@@ -57,6 +58,8 @@ struct block {
 	unsigned long timestamp;
 	int in[2];
 	int out[2];
+	struct line output;
+	bool overflow;
 	int code;
 	pid_t pid;
 
@@ -72,8 +75,7 @@ const char *block_get(const struct block *block, const char *key);
 int block_set(struct block *block, const char *key, const char *value);
 
 int block_for_each(const struct block *block,
-		   int (*func)(const char *key, const char *value, void *data),
-		   void *data);
+		   map_func_t *func, void *data);
 
 void block_printf(struct block *block, int lvl, const char *fmt, ...);
 
@@ -106,6 +108,7 @@ int block_click(struct block *block);
 int block_spawn(struct block *block);
 void block_touch(struct block *block);
 int block_reap(struct block *block);
+int block_read(struct block *block);
 int block_update(struct block *block);
 void block_close(struct block *block);
 

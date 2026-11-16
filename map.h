@@ -19,6 +19,8 @@
 #ifndef MAP_H
 #define MAP_H
 
+#include <stddef.h>
+
 struct map;
 
 struct map *map_create(void);
@@ -28,10 +30,14 @@ int map_copy(struct map *map, const struct map *base);
 
 void map_clear(struct map *map);
 
+/* Values are null-terminated, and may also hold null bytes within len */
 int map_set(struct map *map, const char *key, const char *value);
+int map_setn(struct map *map, const char *key, const char *value, size_t len);
 const char *map_get(const struct map *map, const char *key);
+const char *map_getn(const struct map *map, const char *key, size_t *len);
 
-typedef int map_func_t(const char *key, const char *value, void *data);
+typedef int map_func_t(const char *key, const char *value, size_t len,
+		       void *data);
 int map_for_each(const struct map *map, map_func_t *func, void *data);
 
 #endif /* MAP_H */

@@ -16,6 +16,9 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "bar.h"
 #include "block.h"
 #include "json.h"
@@ -65,7 +68,7 @@ static unsigned int i3bar_indexof(const char *key)
 	return 0;
 }
 
-static int i3bar_line_cb(char *line, size_t num, void *data)
+static int i3bar_line_cb(char *line, size_t len, size_t num, void *data)
 {
 	unsigned int index = num + 1;
 	struct map *map = data;
@@ -78,12 +81,13 @@ static int i3bar_line_cb(char *line, size_t num, void *data)
 
 	key = i3bar_keys[index].key;
 
-	return map_set(map, key, line);
+	return map_setn(map, key, line, len);
 }
 
-int i3bar_read(int fd, size_t count, struct map *map)
+/* Parse up to count complete lines buffered from a raw stream */
+int i3bar_read(struct line *line, size_t count, struct map *map)
 {
-	return line_read(fd, count, i3bar_line_cb, map);
+	return line_parse(line, count, i3bar_line_cb, map);
 }
 
 static void i3bar_print_term(const struct bar *bar)
@@ -104,55 +108,66 @@ static void i3bar_print_term(const struct bar *bar)
 	fflush(stdout);
 }
 
-static int i3bar_print_pair(const char *key, const char *value, void *data)
+/* Pairs of a block being printed */
+struct i3bar_pairs {
+	FILE *stream;
+	unsigned int count;
+};
+
+/* Last status line printed */
+static struct {
+	char *buf;
+	size_t len;
+} i3bar_last;
+
+static int i3bar_print_pair(const char *key, const char *value, size_t len,
+			    void *data)
 {
 	unsigned int index = i3bar_indexof(key);
 	bool string = i3bar_keys[index].string;
-	unsigned int *pcount = data;
-	char buf[BUFSIZ];
+	struct i3bar_pairs *pairs = data;
 	bool escape;
-	int err;
 
 	/* Skip unknown keys */
 	if (!index)
 		return 0;
 
-	if (!value)
+	if (!value) {
 		value = "null";
+		len = strlen(value);
+	}
 
 	if (string) {
-		if (json_is_string(value))
+		if (json_is_string(value, len))
 			escape = false; /* Expected string already quoted */
 		else
 			escape = true; /* Enforce the string type */
 	} else {
-		if (json_is_valid(value))
+		if (json_is_valid(value, len))
 			escape = false; /* Already valid JSON */
 		else
 			escape = true; /* Unquoted string */
 	}
 
-	if (escape) {
-		err = json_escape(value, buf, sizeof(buf));
-		if (err)
-			return err;
+	if (pairs->count++)
+		fprintf(pairs->stream, ",");
 
-		value = buf;
-	}
+	fprintf(pairs->stream, "\"%s\":", key);
 
-	if ((*pcount)++)
-		fprintf(stdout, ",");
+	/* Values of any size are streamed rather than formatted */
+	if (escape)
+		return json_escape(pairs->stream, value, len);
 
-	fprintf(stdout, "\"%s\":%s", key, value);
+	fwrite(value, 1, len, pairs->stream);
 
 	return 0;
 }
 
-static int i3bar_print_block(struct block *block, void *data)
+static int i3bar_print_block(struct block *block, FILE *stream,
+			     unsigned int *mcount)
 {
 	const char *full_text = map_get(block->env, "full_text");
-	unsigned int *mcount = data;
-	unsigned int pcount = 0;
+	struct i3bar_pairs pairs = { .stream = stream };
 	int err;
 
 	/* "full_text" is the only mandatory key */
@@ -162,11 +177,11 @@ static int i3bar_print_block(struct block *block, void *data)
 	}
 
 	if ((*mcount)++)
-		fprintf(stdout, ",");
+		fprintf(stream, ",");
 
-	fprintf(stdout, "{");
-	err = map_for_each(block->env, i3bar_print_pair, &pcount);
-	fprintf(stdout, "}");
+	fprintf(stream, "{");
+	err = map_for_each(block->env, i3bar_print_pair, &pairs);
+	fprintf(stream, "}");
 
 	return err;
 }
@@ -175,23 +190,49 @@ static int i3bar_print_block(struct block *block, void *data)
 {
 	struct block *block = bar->blocks;
 	unsigned int mcount = 0;
-	int err;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *stream;
+	int err = 0;
 
 	if (bar->term) {
 		i3bar_print_term(bar);
 		return 0;
 	}
 
-	fprintf(stdout, ",[");
+	/* Compose the whole status line first */
+	stream = open_memstream(&buf, &len);
+	if (!stream)
+		return -ENOMEM;
+
+	fprintf(stream, ",[");
 	while (block) {
-		err = i3bar_print_block(block, &mcount);
+		err = i3bar_print_block(block, stream, &mcount);
 		if (err)
 			break;
 
 		block = block->next;
 	}
-	fprintf(stdout, "]\n");
+	fprintf(stream, "]\n");
+
+	if (fclose(stream)) {
+		free(buf);
+		return -ENOMEM;
+	}
+
+	/* Status lines may be large, do not repeat an unchanged one */
+	if (i3bar_last.buf && len == i3bar_last.len &&
+	    memcmp(buf, i3bar_last.buf, len) == 0) {
+		free(buf);
+		return err;
+	}
+
+	fwrite(buf, 1, len, stdout);
 	fflush(stdout);
+
+	free(i3bar_last.buf);
+	i3bar_last.buf = buf;
+	i3bar_last.len = len;
 
 	return err;
 }
@@ -241,6 +282,10 @@ void i3bar_stop(struct bar *bar)
 		fprintf(stdout, "]\n");
 		fflush(stdout);
 	}
+
+	free(i3bar_last.buf);
+	i3bar_last.buf = NULL;
+	i3bar_last.len = 0;
 }
 
 static struct block *i3bar_find(struct bar *bar, const struct map *map)
@@ -267,9 +312,35 @@ static struct block *i3bar_find(struct bar *bar, const struct map *map)
 	return NULL;
 }
 
-int i3bar_click(struct bar *bar)
+static int i3bar_click_block(struct bar *bar, const struct map *click)
 {
 	struct block *block;
+	int err;
+
+	/* Look for the corresponding block */
+	block = i3bar_find(bar, click);
+	if (!block)
+		return 0;
+
+	if (block->tainted) {
+		err = block_reset(block);
+		if (err)
+			return err;
+
+		block->tainted = false;
+
+		return i3bar_print(bar);
+	}
+
+	err = map_copy(block->env, click);
+	if (err)
+		return err;
+
+	return block_click(block);
+}
+
+int i3bar_click(struct bar *bar)
+{
 	struct map *click;
 	int err;
 
@@ -279,37 +350,26 @@ int i3bar_click(struct bar *bar)
 
 	for (;;) {
 		/* Each click is one JSON object per line */
-		err = json_read(STDIN_FILENO, 1, click);
-		if (err) {
-			if (err == -EAGAIN)
-				err = 0;
+		err = json_read(&bar->clicks, 1, click);
+		if (err == -EAGAIN) {
+			/* Keep a partial line until the rest of it arrives */
+			err = line_fill(&bar->clicks, STDIN_FILENO);
+			if (err) {
+				if (err == -EAGAIN)
+					err = 0;
 
-			break;
-		}
-
-		/* Look for the corresponding block */
-		block = i3bar_find(bar, click);
-		if (block) {
-			if (block->tainted) {
-				err = block_reset(block);
-				if (err)
-					break;
-
-				block->tainted = false;
-
-				err = i3bar_print(bar);
-				if (err)
-					break;
-			} else {
-				err = map_copy(block->env, click);
-				if (err)
-					break;
-
-				err = block_click(block);
-				if (err)
-					break;
+				break;
 			}
+
+			continue;
 		}
+
+		if (err)
+			break;
+
+		err = i3bar_click_block(bar, click);
+		if (err)
+			break;
 
 		map_clear(click);
 	}

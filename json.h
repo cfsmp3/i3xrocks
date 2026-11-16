@@ -20,14 +20,16 @@
 #define JSON_H
 
 #include <stdbool.h>
+#include <stdio.h>
 
+struct line;
 struct map;
 
-int json_read(int fd, size_t count, struct map *map);
+int json_read(struct line *line, size_t count, struct map *map);
 
-bool json_is_string(const char *str);
-bool json_is_valid(const char *str);
-int json_escape(const char *str, char *buf, size_t size);
+bool json_is_string(const char *str, size_t len);
+bool json_is_valid(const char *str, size_t len);
+int json_escape(FILE *stream, const char *str, size_t len);
 
 #endif /* JSON_H */
 

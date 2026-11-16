@@ -77,7 +77,7 @@ static int ini_property(struct ini *ini, char *key, char *value)
 	return ini->prop_cb(key, value, ini->data);
 }
 
-static int ini_parse_line(char *line, size_t num, void *data)
+static int ini_parse_line(char *line, size_t len, size_t num, void *data)
 {
 	/* comment or empty line? */
 	if (*line == '\0' || *line == '#')

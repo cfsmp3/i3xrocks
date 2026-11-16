@@ -19,9 +19,28 @@
 #ifndef IO_H
 #define IO_H
 
+#include <stdbool.h>
 #include <unistd.h>
 
-typedef int line_cb_t(char *line, size_t num, void *data);
+/* Unparsed input buffered at most, far beyond any sensible status */
+#define LINE_SIZE_MAX	(16 * 1024 * 1024)
+
+/* Input buffered until complete lines are available, whatever their size */
+struct line {
+	char *buf;
+	size_t start;	/* beginning of the unparsed data */
+	size_t len;	/* end of the buffered data */
+	size_t size;	/* allocated size */
+};
+
+/* A line may contain null bytes, len excludes the terminating one */
+typedef int line_cb_t(char *line, size_t len, size_t num, void *data);
+
+int line_fill(struct line *line, int fd);
+bool line_complete(const struct line *line);
+int line_parse(struct line *line, size_t count, line_cb_t *cb, void *data);
+void line_clear(struct line *line);
+
 int line_read(int fd, size_t count, line_cb_t *cb, void *data);
 
 #endif /* IO_H */

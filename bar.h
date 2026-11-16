@@ -22,12 +22,16 @@
 #include <stdbool.h>
 
 #include "block.h"
+#include "line.h"
 #include "sys.h"
 
 struct bar {
 	struct block *blocks;
 	sigset_t sigset;
 	bool term;
+
+	/* Click events read from i3bar */
+	struct line clicks;
 };
 
 #define bar_printf(bar, lvl, fmt, ...) \
@@ -62,7 +66,7 @@ int bar_init(bool term, const char *path, const char *conf_dir, const char *user
 struct map;
 
 /* i3bar.c */
-int i3bar_read(int fd, size_t count, struct map *map);
+int i3bar_read(struct line *line, size_t count, struct map *map);
 int i3bar_click(struct bar *bar);
 int i3bar_print(const struct bar *bar);
 int i3bar_printf(struct block *block, int lvl, const char *msg);

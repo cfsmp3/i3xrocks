@@ -25,6 +25,7 @@
 struct pair {
 	char *key;
 	char *value;
+	size_t len;
 
 	struct pair *next;
 };
@@ -55,23 +56,28 @@ static struct pair *map_prev(const struct map *map, const char *key)
 	return prev;
 }
 
-/* Update the value of a pair */
-static int map_reassign(struct pair *pair, const char *value)
+/* Update the value of a pair, which may contain null bytes */
+static int map_reassign(struct pair *pair, const char *value, size_t len)
 {
 	free(pair->value);
 	pair->value = NULL;
+	pair->len = 0;
 
 	if (value) {
-		pair->value = strdup(value);
+		pair->value = malloc(len + 1);
 		if (!pair->value)
 			return -ENOMEM;
+
+		memcpy(pair->value, value, len);
+		pair->value[len] = '\0';
+		pair->len = len;
 	}
 
 	return 0;
 }
 
 /* Create a new key-value pair */
-static struct pair *map_pair(const char *key, const char *value)
+static struct pair *map_pair(const char *key, const char *value, size_t len)
 {
 	struct pair *pair;
 	int err;
@@ -86,7 +92,7 @@ static struct pair *map_pair(const char *key, const char *value)
 		return NULL;
 	}
 
-	err = map_reassign(pair, value);
+	err = map_reassign(pair, value, len);
 	if (err) {
 		free(pair->key);
 		free(pair);
@@ -99,17 +105,18 @@ static struct pair *map_pair(const char *key, const char *value)
 /* Destroy a new key-value pair */
 void map_unpair(struct pair *pair)
 {
-	map_reassign(pair, NULL);
+	map_reassign(pair, NULL, 0);
 	free(pair->key);
 	free(pair);
 }
 
 /* Insert a key-value pair after a given pair */
-static int map_insert(struct pair *prev, const char *key, const char *value)
+static int map_insert(struct pair *prev, const char *key, const char *value,
+		      size_t len)
 {
 	struct pair *pair;
 
-	pair = map_pair(key, value);
+	pair = map_pair(key, value, len);
 	if (!pair)
 		return -ENOMEM;
 
@@ -128,10 +135,13 @@ static void map_delete(struct pair *prev)
 	map_unpair(pair);
 }
 
-const char *map_get(const struct map *map, const char *key)
+const char *map_getn(const struct map *map, const char *key, size_t *len)
 {
 	struct pair *prev = map_prev(map, key);
 	struct pair *next = prev->next;
+
+	if (len)
+		*len = next ? next->len : 0;
 
 	if (next)
 		return next->value;
@@ -139,15 +149,25 @@ const char *map_get(const struct map *map, const char *key)
 		return NULL;
 }
 
-int map_set(struct map *map, const char *key, const char *value)
+const char *map_get(const struct map *map, const char *key)
+{
+	return map_getn(map, key, NULL);
+}
+
+int map_setn(struct map *map, const char *key, const char *value, size_t len)
 {
 	struct pair *prev = map_prev(map, key);
 	struct pair *next = prev->next;
 
 	if (next)
-		return map_reassign(next, value);
+		return map_reassign(next, value, len);
 	else
-		return map_insert(prev, key, value);
+		return map_insert(prev, key, value, len);
+}
+
+int map_set(struct map *map, const char *key, const char *value)
+{
+	return map_setn(map, key, value, value ? strlen(value) : 0);
 }
 
 int map_for_each(const struct map *map, map_func_t *func, void *data)
@@ -157,7 +177,7 @@ int map_for_each(const struct map *map, map_func_t *func, void *data)
 
 	while (pair->next) {
 		pair = pair->next;
-		err = func(pair->key, pair->value, data);
+		err = func(pair->key, pair->value, pair->len, data);
 		if (err)
 			return err;
 	}
@@ -173,11 +193,11 @@ void map_clear(struct map *map)
 		map_delete(pair);
 }
 
-static int map_dup(const char *key, const char *value, void *data)
+static int map_dup(const char *key, const char *value, size_t len, void *data)
 {
 	struct map *map = data;
 
-	return map_set(map, key, value);
+	return map_setn(map, key, value, len);
 }
 
 int map_copy(struct map *map, const struct map *base)

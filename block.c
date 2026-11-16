@@ -17,6 +17,7 @@
  */
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -45,8 +46,7 @@ int block_reset(struct block *block)
 }
 
 int block_for_each(const struct block *block,
-		   int (*func)(const char *key, const char *value, void *data),
-		   void *data)
+		   map_func_t *func, void *data)
 {
 	return map_for_each(block->env, func, data);
 }
@@ -56,7 +56,8 @@ static bool block_is_spawned(struct block *block)
 	return block->pid > 0;
 }
 
-static int block_setenv(const char *name, const char *value, void *data)
+static int block_setenv(const char *name, const char *value, size_t len,
+			void *data)
 {
 	int err;
 
@@ -89,33 +90,35 @@ static int block_child_env(struct block *block)
 	return block_for_each(block, block_setenv, NULL);
 }
 
-static int block_stdout(struct block *block)
+/* Parse up to count complete lines of buffered output */
+static int block_stdout(struct block *block, size_t count)
 {
+	size_t label_len, full_text_len;
 	const char *label, *full_text;
-	int out = block->out[0];
-	char buf[BUFSIZ];
-	size_t count;
+	char *buf;
 	int err;
 
-	if (block->interval == INTERVAL_PERSIST)
-		count = 1;
-	else
-		count = -1; /* SIZE_MAX */
-
 	if (block->format == FORMAT_JSON)
-		err = json_read(out, count, block->env);
+		err = json_read(&block->output, count, block->env);
 	else
-		err = i3bar_read(out, count, block->env);
+		err = i3bar_read(&block->output, count, block->env);
 
 	if (err && err != -EAGAIN)
 		return err;
 
 	/* Deprecated label */
-	label = block_get(block, "label");
-	full_text = block_get(block, "full_text");
+	label = map_getn(block->env, "label", &label_len);
+	full_text = map_getn(block->env, "full_text", &full_text_len);
 	if (label && full_text) {
-		snprintf(buf, sizeof(buf), "%s%s", label, full_text);
-		err = block_set(block, "full_text", buf);
+		buf = malloc(label_len + full_text_len + 1);
+		if (!buf)
+			return -ENOMEM;
+
+		memcpy(buf, label, label_len);
+		memcpy(buf + label_len, full_text, full_text_len);
+		err = map_setn(block->env, "full_text", buf,
+			       label_len + full_text_len);
+		free(buf);
 		if (err)
 			return err;
 	}
@@ -123,7 +126,7 @@ static int block_stdout(struct block *block)
 	return 0;
 }
 
-int block_update(struct block *block)
+static int block_update_lines(struct block *block, size_t count)
 {
 	int err;
 
@@ -132,7 +135,7 @@ int block_update(struct block *block)
 	if (err)
 		return err;
 
-	err = block_stdout(block);
+	err = block_stdout(block, count);
 	if (err)
 		return err;
 
@@ -148,32 +151,110 @@ int block_update(struct block *block)
 	return 0;
 }
 
-static int block_send_key(const char *key, const char *value, void *data)
+/* A command writing that much without a status to show is not read further:
+ * it then blocks on its full pipe, rather than the bar exhausting memory.
+ */
+static int block_overflow(struct block *block)
 {
-	struct block *block = data;
-	char buf[BUFSIZ];
-	int err;
-
-	if (!json_is_valid(value)) {
-		err = json_escape(value, buf, sizeof(buf));
-		if (err)
-			return err;
-
-		value = buf;
+	/* Report it once, not on each signal still queued for the output */
+	if (!block->overflow) {
+		block_error(block, "Command '%s' wrote over %d MiB without a status",
+			    block->command, LINE_SIZE_MAX / (1024 * 1024));
+		block->overflow = true;
 	}
 
-	dprintf(block->in[1], ",\"%s\":%s", key, value);
+	return -ENOBUFS;
+}
+
+/* Read the output available so far, so that the command never blocks on a
+ * full pipe. A persistent block is updated from each complete line, a partial
+ * line is kept until its end arrives. Return -EAGAIN if nothing changed.
+ */
+int block_read(struct block *block)
+{
+	bool updated = false;
+	int err, ret;
+
+	do {
+		err = line_fill(&block->output, block->out[0]);
+
+		while (block->interval == INTERVAL_PERSIST &&
+		       line_complete(&block->output)) {
+			updated = true;
+
+			/* An invalid line is consumed, other errors are not */
+			ret = block_update_lines(block, 1);
+			if (ret && ret != -EINVAL)
+				return ret;
+		}
+	} while (!err);
+
+	if (err == -ENOBUFS)
+		return block_overflow(block);
+
+	if (err != -EAGAIN)
+		return err;
+
+	return updated ? 0 : -EAGAIN;
+}
+
+/* Update a block from the whole output of its exited command */
+int block_update(struct block *block)
+{
+	int err;
+
+	/* Collect what was not read yet */
+	do {
+		err = line_fill(&block->output, block->out[0]);
+	} while (!err);
+
+	if (err == -ENOBUFS)
+		return block_overflow(block);
+
+	if (err != -EAGAIN)
+		return err;
+
+	return block_update_lines(block, -1); /* SIZE_MAX */
+}
+
+static int block_send_key(const char *key, const char *value, size_t len,
+			  void *data)
+{
+	FILE *stream = data;
+
+	fprintf(stream, ",\"%s\":", key);
+
+	if (!json_is_valid(value, len))
+		return json_escape(stream, value, len);
+
+	fwrite(value, 1, len, stream);
 
 	return 0;
 }
 
 static int block_send_json(struct block *block)
 {
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *stream;
 	int err;
 
-	dprintf(block->in[1], "{\"\":\"\"");
-	err = block_for_each(block, block_send_key, block);
-	dprintf(block->in[1], "}\n");
+	/* Compose the whole object first, then write it as a single line */
+	stream = open_memstream(&buf, &len);
+	if (!stream)
+		return -ENOMEM;
+
+	fprintf(stream, "{\"\":\"\"");
+	err = block_for_each(block, block_send_key, stream);
+	fprintf(stream, "}\n");
+
+	if (fclose(stream) && !err)
+		err = -ENOMEM;
+
+	if (!err)
+		err = sys_write(block->in[1], buf, len);
+
+	free(buf);
 
 	return err;
 }
@@ -318,17 +399,8 @@ static int block_parent_stdin(struct block *block)
 
 static int block_parent_stdout(struct block *block)
 {
-	int err;
-
 	/* Close write end of stdout pipe */
-	err = sys_close(block->out[1]);
-	if (err)
-		return err;
-
-	if (block->interval == INTERVAL_PERSIST)
-		return sys_async(block->out[0], SIGRTMIN);
-
-	return 0;
+	return sys_close(block->out[1]);
 }
 
 static int block_parent(struct block *block)
@@ -370,6 +442,13 @@ static int block_open(struct block *block)
 	int err;
 
 	err = sys_pipe(block->out);
+	if (err)
+		return err;
+
+	/* Read output as it arrives, whatever its size. This is set up before
+	 * forking, so that output written right away is noticed as well.
+	 */
+	err = sys_async(block->out[0], SIGRTMIN);
 	if (err)
 		return err;
 
@@ -442,6 +521,9 @@ void block_close(struct block *block)
 		block_error(block, "failed to close stdout");
 
 	block->out[0] = -1;
+
+	line_clear(&block->output);
+	block->overflow = false;
 }
 
 int block_reap(struct block *block)
@@ -536,6 +618,7 @@ int block_setup(struct block *block)
 
 void block_destroy(struct block *block)
 {
+	line_clear(&block->output);
 	map_destroy(block->config);
 	map_destroy(block->env);
 	free(block->name);
